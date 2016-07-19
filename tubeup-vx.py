@@ -30,16 +30,17 @@ import logging
 
 __doc__ = """tubeup.py - Download a video with Youtube-dl, then upload to Internet Archive, passing all metadata.
 
+
 Usage:
-  tubeup.py <url>...
-  tubeup.py [--proxy <prox>]
-  tubeup.py -h | --help
-
+  tubeup <url>... [--metadata=<key:value>...]
+  tubeup [--proxy <prox>]
+  tubeup -h | --help
 Arguments:
-  <url>           Youtube-dl compatible URL to download.
-                  Check Youtube-dl documentation for a list
-                  of compatible websites. 
-
+  <url>                         Youtube-dl compatible URL to download.
+                                Check Youtube-dl documentation for a list
+                                of compatible websites.
+  -m, --metadata=<key:value>    Custom metadata to add to the archive.org
+                                item.
 Options:
   -h --help       Show this screen.
   --proxy <prox>  Use a proxy while uploading.
@@ -73,7 +74,8 @@ def download(URLs, proxy_url):
         'progress_with_newline': True,
         'forcetitle': True,
         'continuedl': True,
-        'retries': 100,
+        'retries': 9001,
+        'fragment_retries': 9001,
         'forcejson': True,
         'writeinfojson': True,
         'writedescription': True,
@@ -98,16 +100,15 @@ def download(URLs, proxy_url):
         ydl.download(URLs)
 
 # upload a video to the Internet Archive
-def upload_ia(videobasename):
+def upload_ia(videobasename, custom_meta=None):
     # obtain metadata from JSON
     json_fname = videobasename + '.info.json'
     with open(json_fname) as f:    
         vid_meta = json.load(f)
     
     itemname = '%s-%s' % (vid_meta['extractor'], vid_meta['display_id'])
-    language = 'en' # I doubt we usually archive spanish videos, but maybe this should be a cmd argument?
-    collection = 'uploadscollection-vxbinaca'
-    title = '%s: %s - %s' % (vid_meta['extractor_key'], vid_meta['display_id'], vid_meta['title']) # Youtube: LE2v3sUzTH4 - THIS IS A BUTTERFLY!
+    collection = 'ytpmv-mad'
+    title = '%s' % (vid_meta['title']) # THIS IS A BUTTERFLY!
     videourl = vid_meta['webpage_url']
     cc = False # let's not misapply creative commons
     
@@ -176,9 +177,13 @@ def upload_ia(videobasename):
 
     # upload the item to the Internet Archive
     item = internetarchive.get_item(itemname)
-    meta = dict(mediatype='movies', creator=uploader, language=language, collection=collection, title=title, description=u'{0} <br/><br/>Source: <a href="{1}">{2}</a><br/>Uploader: <a href="{3}">{4}</a><br/>Upload date: {5}'.format(description, videourl, videourl, uploader_url, uploader, upload_date), date=upload_date, year=upload_year, subject=tags_string, originalurl=videourl, licenseurl=(cc and 'http://creativecommons.org/licenses/by/3.0/' or ''))
+    meta = dict(mediatype='movies', creator=uploader, collection=collection, title=title, description=u'{0} <br/><br/>Source: <a href="{1}">{2}</a><br/>Uploader: <a href="{3}">{4}</a><br/>Upload date: {5}'.format(description, videourl, videourl, uploader_url, uploader, upload_date), date=upload_date, year=upload_year, subject=tags_string, originalurl=videourl, licenseurl=(cc and 'http://creativecommons.org/licenses/by/3.0/' or ''))
     
-    item.upload(vid_files, metadata=meta)
+    # override default metadata with any supplemental metadata provided.
+    meta.update(custom_meta)
+ 
+    
+    item.upload(vid_files, metadata=meta, retries=9001, request_kwargs=dict(timeout=9001))
     
     # return item identifier and metadata as output
     return itemname, meta
@@ -222,13 +227,16 @@ def main():
     # download all URLs with youtube-dl
     download(URLs, proxy_url)
     
+    # parse supplemental metadata.
+    md = internetarchive.cli.argparser.get_args_dict(args['--metadata'])
+    
     # while downloading, if the download hook returns status "finished", myhook() will append the basename to the `to_upload` array.
     
     # upload all URLs with metadata to the Internet Archive
     global to_upload
     for video in to_upload:
         print(":: Uploading %s..." % video)
-        identifier, meta = upload_ia(video)
+        identifier, meta = upload_ia(video, custom_meta=md)
         
         print("\n:: Upload Finished. Item information:")
         print("Title: %s" % meta['title'])
