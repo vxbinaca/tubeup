@@ -23,17 +23,20 @@ import sys
 import glob
 import json
 import time
+from datetime import datetime
 import docopt
 import youtube_dl
 import internetarchive
+import internetarchive.cli
 import logging
+import gettext
+gettext.install("tubeup", "locale")
 
-__doc__ = """tubeup.py - Download a video with Youtube-dl, then upload to Internet Archive, passing all metadata.
-
-
+__doc__ = _("""tubeup - Download a video with Youtube-dl, then upload to Internet Archive, passing all metadata.
 Usage:
   tubeup <url>... [--metadata=<key:value>...]
-  tubeup [--proxy <prox>]
+  tubeup <url> [--username <user>] [--password <pass>]
+  tubeup <url> [--proxy <prox>]
   tubeup -h | --help
 Arguments:
   <url>                         Youtube-dl compatible URL to download.
@@ -42,9 +45,11 @@ Arguments:
   -m, --metadata=<key:value>    Custom metadata to add to the archive.org
                                 item.
 Options:
-  -h --help       Show this screen.
-  --proxy <prox>  Use a proxy while uploading.
-"""
+  -h --help         Show this screen.
+  --proxy <prox>    Use a proxy while uploading.
+  --username <user> Provide a username, for sites like Nico Nico Douga.
+  --password <pass> Provide a password, for sites like Nico Nico Douga.
+""")
 
 def mkdirs(path):
 	"""Make directory, if it doesn't exist."""
@@ -62,20 +67,22 @@ class MyLogger(object):
     def error(self, msg):
         print(msg)
 
-# equivalent of youtube-dl --title --continue --retries 4 --write-info-json --write-description --write-thumbnail --write-annotations --all-subs --ignore-errors URL 
+# equivalent of youtube-dl --title --continue --retries 9001 --fragment-retries 9001 --write-info-json --write-description --write-thumbnail --write-annotations --all-subs --ignore-errors --convert-subs 'srt' --no-overwrites --prefer-ffmpeg --call-home URL 
 # uses downloads/ folder and safe title in output template
-def download(URLs, proxy_url):
+def download(URLs, proxy_url, username, password):
+    mkdirs(os.path.expanduser('~/.tubeup'))
+    mkdirs(os.path.expanduser('~/.tubeup/downloads'))
     
     ydl_opts = {
-        'outtmpl': 'downloads/%(title)s-%(id)s.%(ext)s',
-#        'download_archive': 'downloads/.ytdlarchive', # I guess we will avoid doing this because it prevents failed uploads from being redone in our current system. Maybe when we turn it into an OOP library?
+        'outtmpl': os.path.expanduser('~/.tubeup/downloads/%(title)s-%(id)s.%(ext)s'),
+        'download_archive': os.path.expanduser('~/.tubeup/.ytdlarchive'), ## I guess we will avoid doing this because it prevents failed uploads from being redone in our current system. Maybe when we turn it into an OOP library?
         'restrictfilenames': True,
-        'verbose': True,
+        'verbose': True,		## We only care about errors not successes, anything else is pollution
         'progress_with_newline': True,
         'forcetitle': True,
         'continuedl': True,
-        'retries': 9001,
-        'fragment_retries': 9001,
+        'retries': 9001,		
+	'fragment_retries': 9001,	
         'forcejson': True,
         'writeinfojson': True,
         'writedescription': True,
@@ -83,12 +90,24 @@ def download(URLs, proxy_url):
         'writeannotations': True,
         'writesubtitles': True,
         'allsubtitles': True,
+	'ignoreerrors': True,		## Geo-blocked, copyrighted/private/deleted will be printed to STDOUT and channel ripping will continue uninterupted, use with verbose off
+	'fixup': 'warn',		## Slightly more verbosity for debugging problems
+	'nooverwrites': True,		## Don't touch what's already been downloaded, speeds things
+	'consoletitle': True,		## Download percentage in console title
+	'prefer_ffmpeg': True,		## ffmpeg is better than avconv, let's prefer it's use
+        'call_home': True,		## Warns on out of date youtube-dl script, helps debugging for youtube-dl devs
         'logger': MyLogger(),
         'progress_hooks': [my_hook]
     }
     
     if proxy_url is not None: # use proxy url as argument
         ydl_opts['proxy'] = proxy_url
+    
+    if username is not None: # use username as argument, e.g. nicovideo
+        ydl_opts['username'] = username
+    
+    if password is not None: # use password as argument, e.g. nicovideo
+        ydl_opts['password'] = password
     
     # format: We don't set a default format. Youtube-dl will choose the best option for us automatically.
     # Since the end of April 2015 and version 2015.04.26 youtube-dl uses -f bestvideo+bestaudio/best as default format selection (see #5447, #5456). 
@@ -107,11 +126,14 @@ def upload_ia(videobasename, custom_meta=None):
         vid_meta = json.load(f)
     
     itemname = '%s-%s' % (vid_meta['extractor'], vid_meta['display_id'])
-    collection = 'ytpmv-mad'
     title = '%s' % (vid_meta['title']) # THIS IS A BUTTERFLY!
     videourl = vid_meta['webpage_url']
+    if 'soundcloud.com' in videourl:
+        collection = 'opensource_audio'
+    else:
+        collection = 'opensource_movies'
     cc = False # let's not misapply creative commons
-    
+
     # some video services don't tell you the uploader, use our program's name in that case
     if 'uploader' in vid_meta:
         uploader = vid_meta['uploader']
@@ -123,12 +145,12 @@ def upload_ia(videobasename, custom_meta=None):
     else:
         uploader_url = videourl
 
-    if 'upload_date' in vid_meta: # some videos don't give an upload date
-        if vid_meta['upload_date'] != "":
-            upload_date = vid_meta['upload_date']
+    try: # some videos don't give an upload date
+            d = datetime.strptime(vid_meta['upload_date'], '%Y%m%d')
+            upload_date = d.isoformat().split('T')[0]
             upload_year = upload_date[:4] # 20150614 -> 2015
-    else: # use current date and time as default values
-        upload_date = time.strftime("%Y%m%d")
+    except KeyError: # use current date and time as default values
+        upload_date = time.strftime("%Y-%m-%d")
         upload_year = time.strftime("%Y")
     
     # load up tags into an IA compatible semicolon-separated string
@@ -177,13 +199,12 @@ def upload_ia(videobasename, custom_meta=None):
 
     # upload the item to the Internet Archive
     item = internetarchive.get_item(itemname)
-    meta = dict(mediatype='movies', creator=uploader, collection=collection, title=title, description=u'{0} <br/><br/>Source: <a href="{1}">{2}</a><br/>Uploader: <a href="{3}">{4}</a><br/>Upload date: {5}'.format(description, videourl, videourl, uploader_url, uploader, upload_date), date=upload_date, year=upload_year, subject=tags_string, originalurl=videourl, licenseurl=(cc and 'http://creativecommons.org/licenses/by/3.0/' or ''))
+    meta = dict(mediatype='movies', creator=uploader, collection=collection, title=title, description=u'{0} <br/><br/>Uploader: <a href="{3}">{4}</a>'.format(description, videourl, videourl, uploader_url, uploader, upload_date), date=upload_date, year=upload_year, subject=tags_string, originalurl=videourl, licenseurl=(cc and 'http://creativecommons.org/licenses/by/3.0/' or ''))
     
     # override default metadata with any supplemental metadata provided.
     meta.update(custom_meta)
- 
-    
-    item.upload(vid_files, metadata=meta, retries=9001, request_kwargs=dict(timeout=9001))
+
+    item.upload(vid_files, metadata=meta, retries=9001, request_kwargs=dict(timeout=9001), delete=True)
     
     # return item identifier and metadata as output
     return itemname, meta
@@ -196,15 +217,14 @@ def my_hook(d):
     filename, file_extension = os.path.splitext(d['filename'])
     if d['status'] == 'finished': # only upload if download was a success
         print(d)    # display download stats
-        print(':: Downloaded: %s...' % d['filename'])
+        print(_(':: Downloaded: %s...') % d['filename'])
         
         global to_upload
         videobasename = re.sub(r'(\.f\d+)', '', filename) # remove .fxxx from filename (e.g. .f141.mp4)
         if videobasename not in to_upload: # don't add if it's already in the list
             to_upload.append(videobasename)
-
     if d['status'] == 'error':
-        print(':: Error occurred while downloading: %s.' % d['filename'])
+        print(_(':: Error occurred while downloading: %s.') % d['filename'])
 
 def main():
     # display log output from internetarchive libraries: http://stackoverflow.com/a/14058475
@@ -223,10 +243,12 @@ def main():
     # test url: https://www.youtube.com/watch?v=LE2v3sUzTH4
     URLs = args['<url>']
     proxy_url = args['--proxy']
+    username = args['--username']
+    password = args['--password']
 
     # download all URLs with youtube-dl
-    download(URLs, proxy_url)
-    
+    download(URLs, proxy_url, username, password)
+
     # parse supplemental metadata.
     md = internetarchive.cli.argparser.get_args_dict(args['--metadata'])
     
@@ -235,12 +257,12 @@ def main():
     # upload all URLs with metadata to the Internet Archive
     global to_upload
     for video in to_upload:
-        print(":: Uploading %s..." % video)
+        print(_(":: Uploading %s...") % video)
         identifier, meta = upload_ia(video, custom_meta=md)
         
-        print("\n:: Upload Finished. Item information:")
-        print("Title: %s" % meta['title'])
-        print("Upload URL: http://archive.org/details/%s" % identifier)
+        print(_("\n:: Upload Finished. Item information:"))
+        print(_("Title: %s") % meta['title'])
+        print(_("Upload URL: https://archive.org/details/%s") % identifier)
 
 if __name__ == '__main__':
     main()
